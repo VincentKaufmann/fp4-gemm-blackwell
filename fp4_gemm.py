@@ -49,6 +49,12 @@ _lib.fp4_gemm_run.argtypes = [
 _lib.fp4_gemm_cleanup.restype = None
 _lib.fp4_gemm_cleanup.argtypes = []
 
+_lib.fp4_gemm_prealloc.restype = ctypes.c_int
+_lib.fp4_gemm_prealloc.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+_lib.fp4_gemm_sync.restype = None
+_lib.fp4_gemm_sync.argtypes = []
+
 # Pre-quantized weight cache API
 _lib.fp4_quantize_weights.restype = ctypes.c_void_p
 _lib.fp4_quantize_weights.argtypes = [
@@ -222,6 +228,29 @@ def fp4_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = None)
     return out
 
 
+def sync():
+    """Synchronize CUDA stream. Call after pipelined FP4 operations."""
+    _lib.fp4_gemm_sync()
+
+
+def prealloc(max_M: int, max_N: int, max_K: int):
+    """
+    Pre-allocate internal buffers for the maximum expected dimensions.
+    Call once before inference to avoid reallocation during forward passes.
+
+    Args:
+        max_M: Maximum M dimension (batch_size * seq_len, rounded to 128)
+        max_N: Maximum N dimension across all weight matrices
+        max_K: Maximum K dimension across all weight matrices
+    """
+    max_M = _pad_to_multiple(max_M, 128)
+    max_N = _pad_to_multiple(max_N, 128)
+    max_K = _pad_to_multiple(max_K, 128)
+    rc = _lib.fp4_gemm_prealloc(max_M, max_N, max_K)
+    if rc != 0:
+        raise RuntimeError(f"fp4_gemm_prealloc failed with code {rc}")
+
+
 def cleanup():
     """Release CUDA memory held by the FP4 GEMM library."""
     _lib.fp4_gemm_cleanup()
@@ -292,12 +321,13 @@ class FP4WeightCache:
         # Scale factors: 1 byte per 16 elements
         self.sf_bytes = self.N * (self.K // 16)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, sync: bool = True) -> torch.Tensor:
         """
         Run FP4 GEMM: output = x @ cached_weight.T + bias
 
         Args:
             x: Input activation [..., K], BF16 on CUDA
+            sync: If True, synchronize after GEMM. Set False for pipelined calls.
 
         Returns:
             Output tensor [..., N]
@@ -346,6 +376,10 @@ class FP4WeightCache:
 
         if rc != 0:
             raise RuntimeError(f"fp4_gemm_run_cached failed with error code {rc}")
+
+        # Sync if requested (skip for pipelined calls)
+        if sync:
+            _lib.fp4_gemm_sync()
 
         # Unpad
         if m_padded or self.padded:

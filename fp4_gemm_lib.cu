@@ -347,6 +347,13 @@ struct FP4GemmState {
     bool initialized;
     int M, N, K;
 
+    // Maximum allocated dimensions (for pre-allocation)
+    int max_M, max_N, max_K;
+    size_t alloc_A_fp4;   // bytes allocated for A FP4 data
+    size_t alloc_B_fp4;   // bytes allocated for B FP4 data
+    size_t alloc_SFA;     // bytes allocated for A scale factors
+    size_t alloc_SFB;     // bytes allocated for B scale factors
+
     // Device buffers for quantized data
     uint8_t* d_A_fp4;
     uint8_t* d_B_fp4;
@@ -395,8 +402,49 @@ extern "C" {
 
 int fp4_gemm_sf_vec_size() { return SF_VEC_SIZE; }
 
+// Check if current buffers can handle the requested dimensions
+static bool buffers_sufficient(int M, int N, int K) {
+    if (!g.initialized) return false;
+    size_t need_A_fp4 = (size_t)M * K / 2;
+    size_t need_B_fp4 = (size_t)N * K / 2;
+    // Compute SFA/SFB sizes for this M, N, K
+    auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
+    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
+    size_t need_SFA = cute::size(cute::filter_zeros(layout_SFA));
+    size_t need_SFB = cute::size(cute::filter_zeros(layout_SFB));
+
+    // Compute workspace
+    auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+    auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K, 1},
+        {nullptr, stride_A, nullptr, stride_B, nullptr, layout_SFA, nullptr, layout_SFB},
+        {{1.0f, 0.0f}, nullptr, stride_C, nullptr, stride_D}
+    };
+    size_t need_workspace = Gemm::get_workspace_size(args);
+
+    return g.alloc_A_fp4 >= need_A_fp4 &&
+           g.alloc_B_fp4 >= need_B_fp4 &&
+           g.alloc_SFA >= need_SFA &&
+           g.alloc_SFB >= need_SFB &&
+           g.workspace_size >= need_workspace;
+}
+
 int fp4_gemm_init(int M, int N, int K) {
     if (g.initialized && g.M == M && g.N == N && g.K == K) return 0;
+
+    // If pre-allocated buffers are large enough, just update dimensions
+    if (buffers_sufficient(M, N, K)) {
+        auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
+        auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
+        g.sfa_elems = cute::size(cute::filter_zeros(layout_SFA));
+        g.sfb_elems = cute::size(cute::filter_zeros(layout_SFB));
+        g.M = M; g.N = N; g.K = K;
+        return 0;
+    }
+
     cleanup();
 
     if (M % 128 != 0 || N % 128 != 0 || K % 128 != 0) {
@@ -411,10 +459,15 @@ int fp4_gemm_init(int M, int N, int K) {
     g.sfb_elems = cute::size(cute::filter_zeros(layout_SFB));
 
     // Device buffers
-    cudaMalloc(&g.d_A_fp4, (size_t)M * K / 2);
-    cudaMalloc(&g.d_B_fp4, (size_t)N * K / 2);
-    cudaMalloc(&g.d_SFA, g.sfa_elems);
-    cudaMalloc(&g.d_SFB, g.sfb_elems);
+    g.alloc_A_fp4 = (size_t)M * K / 2;
+    g.alloc_B_fp4 = (size_t)N * K / 2;
+    g.alloc_SFA = g.sfa_elems;
+    g.alloc_SFB = g.sfb_elems;
+
+    cudaMalloc(&g.d_A_fp4, g.alloc_A_fp4);
+    cudaMalloc(&g.d_B_fp4, g.alloc_B_fp4);
+    cudaMalloc(&g.d_SFA, g.alloc_SFA);
+    cudaMalloc(&g.d_SFB, g.alloc_SFB);
 
     // Host buffers for host path
     g.h_A = (cutlass::bfloat16_t*)malloc((size_t)M * K * sizeof(cutlass::bfloat16_t));
@@ -441,8 +494,14 @@ int fp4_gemm_init(int M, int N, int K) {
     if (g.workspace_size > 0) cudaMalloc(&g.d_workspace, g.workspace_size);
 
     g.M = M; g.N = N; g.K = K;
+    g.max_M = M; g.max_N = N; g.max_K = K;
     g.initialized = true;
     return 0;
+}
+
+// Pre-allocate buffers for maximum dimensions to avoid reallocation during inference
+int fp4_gemm_prealloc(int max_M, int max_N, int max_K) {
+    return fp4_gemm_init(max_M, max_N, max_K);
 }
 
 // Run FP4 GEMM with GPU-side quantization
@@ -591,6 +650,9 @@ int fp4_gemm_run_host(
 }
 
 void fp4_gemm_cleanup() { cleanup(); }
+
+// Sync helper
+void fp4_gemm_sync() { cudaDeviceSynchronize(); }
 
 // ============================================================================
 // Pre-quantized weight cache API
@@ -772,7 +834,8 @@ int fp4_gemm_run_cached(
         return -4;
     }
 
-    cudaDeviceSynchronize();
+    // No sync here — caller should call fp4_gemm_sync() when needed
+    // This allows pipelining multiple GEMMs without roundtrips
     return 0;
 }
 
