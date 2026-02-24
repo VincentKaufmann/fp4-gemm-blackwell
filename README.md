@@ -1,4 +1,4 @@
-# FP4 GEMM Library for NVIDIA DGX Spark / GeForce RTX 50 Series
+# FP4 CUDA Kernel for NVIDIA Blackwell (DGX Spark / RTX 50 Series)
 
 Hardware FP4 tensor core GEMM for Blackwell SM120/SM121, built on CUTLASS 3.8.
 
@@ -62,14 +62,14 @@ BF16 Input B [N, K]  -->  GPU Quantize Kernel  -->  FP4 packed [N, K/2] + UE4M3 
 ## Quick Start
 
 ```bash
-git clone https://github.com/VincentKaufmann/fp4-gemm-blackwell.git
-cd fp4-gemm-blackwell
+git clone https://github.com/VincentKaufmann/fp4-cuda-kernel.git
+cd fp4-cuda-kernel
 ./build.sh            # Auto-detects GPU, clones CUTLASS, builds library
 ```
 
 Then in Python:
 ```python
-import sys; sys.path.insert(0, '/path/to/fp4-gemm-blackwell')
+import sys; sys.path.insert(0, '/path/to/fp4-cuda-kernel')
 from fp4_gemm import fp4_matmul
 import torch
 
@@ -148,11 +148,11 @@ One CUDA thread per 16-element scale block:
 If you find this useful, please cite:
 
 ```
-@software{fp4_gemm_blackwell,
+@software{fp4_cuda_kernel,
   author = {Koc, Vincent},
-  title = {FP4 GEMM Library for Blackwell SM120/SM121},
+  title = {FP4 CUDA Kernel for Blackwell SM120/SM121},
   year = {2026},
-  url = {https://github.com/VincentKaufmann/fp4-gemm-blackwell}
+  url = {https://github.com/VincentKaufmann/fp4-cuda-kernel}
 }
 ```
 
