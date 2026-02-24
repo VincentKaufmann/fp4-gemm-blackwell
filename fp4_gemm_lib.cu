@@ -592,4 +592,188 @@ int fp4_gemm_run_host(
 
 void fp4_gemm_cleanup() { cleanup(); }
 
+// ============================================================================
+// Pre-quantized weight cache API
+// ============================================================================
+
+// Cached weight handle - stores pre-quantized FP4 data + scales on device
+struct FP4WeightCache {
+    uint8_t* d_fp4;    // [N, K/2] packed FP4 data on device
+    uint8_t* d_sf;     // Scale factors in CUTLASS interleaved layout
+    int N;
+    int K;
+    int sf_elems;      // Number of scale factor elements
+};
+
+// Quantize BF16 weights once and return a cache handle
+// The caller must call fp4_weight_cache_free() when done
+void* fp4_quantize_weights(const void* weight_bf16, int N, int K) {
+    if (N % 128 != 0 || K % 128 != 0) {
+        fprintf(stderr, "fp4_quantize_weights: N=%d, K=%d must be multiples of 128\n", N, K);
+        return nullptr;
+    }
+
+    // Compute scale factor layout size (B matrix uses SFB layout)
+    // We need a dummy M to compute the layout, but SFB only depends on N and K
+    int dummy_M = 128;
+    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
+        cute::make_shape(dummy_M, N, K, 1));
+    int sf_elems = cute::size(cute::filter_zeros(layout_SFB));
+
+    // Allocate device buffers
+    FP4WeightCache* cache = new FP4WeightCache();
+    cache->N = N;
+    cache->K = K;
+    cache->sf_elems = sf_elems;
+
+    cudaError_t err;
+    err = cudaMalloc(&cache->d_fp4, (size_t)N * K / 2);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "fp4_quantize_weights: cudaMalloc fp4 failed: %s\n", cudaGetErrorString(err));
+        delete cache;
+        return nullptr;
+    }
+
+    err = cudaMalloc(&cache->d_sf, sf_elems);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "fp4_quantize_weights: cudaMalloc sf failed: %s\n", cudaGetErrorString(err));
+        cudaFree(cache->d_fp4);
+        delete cache;
+        return nullptr;
+    }
+
+    // Quantize on GPU
+    int nsb = K / SF_VEC_SIZE;
+    int total_blocks = N * nsb;
+    int threads = 256;
+    int blocks = (total_blocks + threads - 1) / threads;
+
+    quantize_bf16_to_fp4_kernel<<<blocks, threads>>>(
+        (const __nv_bfloat16*)weight_bf16,
+        cache->d_fp4, cache->d_sf,
+        N, K, nsb);
+
+    cudaDeviceSynchronize();
+    return (void*)cache;
+}
+
+// Get the cached FP4 data pointer
+const void* fp4_weight_cache_fp4_ptr(const void* cache_handle) {
+    if (!cache_handle) return nullptr;
+    return ((const FP4WeightCache*)cache_handle)->d_fp4;
+}
+
+// Get the cached scale factor pointer
+const void* fp4_weight_cache_sf_ptr(const void* cache_handle) {
+    if (!cache_handle) return nullptr;
+    return ((const FP4WeightCache*)cache_handle)->d_sf;
+}
+
+// Get cached weight dimensions
+int fp4_weight_cache_N(const void* cache_handle) {
+    return cache_handle ? ((const FP4WeightCache*)cache_handle)->N : 0;
+}
+
+int fp4_weight_cache_K(const void* cache_handle) {
+    return cache_handle ? ((const FP4WeightCache*)cache_handle)->K : 0;
+}
+
+// Free cached weight data
+void fp4_weight_cache_free(void* cache_handle) {
+    if (!cache_handle) return;
+    FP4WeightCache* cache = (FP4WeightCache*)cache_handle;
+    cudaFree(cache->d_fp4);
+    cudaFree(cache->d_sf);
+    delete cache;
+}
+
+// Run FP4 GEMM with pre-quantized B weights (only quantize A on the fly)
+// This skips B quantization entirely - weights are already in FP4 + CUTLASS scale layout
+int fp4_gemm_run_cached(
+    const void* A_bf16,          // [M, K] BF16 activations (device ptr)
+    const void* cache_handle,    // Pre-quantized weight cache handle
+    const void* C_bf16,          // [M, N] BF16 (device ptr, or NULL)
+    void* D_bf16,                // [M, N] BF16 output (device ptr)
+    int M,
+    float alpha, float beta)
+{
+    if (!cache_handle) {
+        fprintf(stderr, "fp4_gemm_run_cached: null cache handle\n");
+        return -1;
+    }
+
+    const FP4WeightCache* cache = (const FP4WeightCache*)cache_handle;
+    int N = cache->N;
+    int K = cache->K;
+
+    if (M % 128 != 0) {
+        fprintf(stderr, "fp4_gemm_run_cached: M=%d must be a multiple of 128\n", M);
+        return -1;
+    }
+
+    // Initialize state (allocates A-side buffers + workspace)
+    if (!g.initialized || g.M != M || g.N != N || g.K != K) {
+        int rc = fp4_gemm_init(M, N, K);
+        if (rc != 0) return rc;
+    }
+
+    int nsb = K / SF_VEC_SIZE;
+
+    // Only quantize A on GPU (B is pre-quantized)
+    {
+        int total_blocks = M * nsb;
+        int threads = 256;
+        int blocks = (total_blocks + threads - 1) / threads;
+        quantize_bf16_to_fp4_kernel<<<blocks, threads>>>(
+            (const __nv_bfloat16*)A_bf16, g.d_A_fp4, g.d_SFA, M, K, nsb);
+    }
+
+    // Run CUTLASS GEMM with quantized A + cached B
+    auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
+    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
+    auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+    auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
+
+    typename Gemm::Arguments arguments{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {M, N, K, 1},
+        {
+            reinterpret_cast<const ElementA::DataType*>(g.d_A_fp4), stride_A,
+            reinterpret_cast<const ElementB::DataType*>(cache->d_fp4), stride_B,
+            reinterpret_cast<const ScaleFactorType*>(g.d_SFA), layout_SFA,
+            reinterpret_cast<const ScaleFactorType*>(cache->d_sf), layout_SFB
+        },
+        {
+            {alpha, beta},
+            reinterpret_cast<const ElementC*>(C_bf16 ? C_bf16 : D_bf16), stride_C,
+            reinterpret_cast<ElementD*>(D_bf16), stride_D
+        }
+    };
+
+    Gemm gemm;
+
+    auto status = gemm.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) {
+        fprintf(stderr, "fp4_gemm_run_cached: can_implement: %s\n", cutlassGetStatusString(status));
+        return -2;
+    }
+
+    status = gemm.initialize(arguments, g.d_workspace);
+    if (status != cutlass::Status::kSuccess) {
+        fprintf(stderr, "fp4_gemm_run_cached: initialize: %s\n", cutlassGetStatusString(status));
+        return -3;
+    }
+
+    status = gemm.run();
+    if (status != cutlass::Status::kSuccess) {
+        fprintf(stderr, "fp4_gemm_run_cached: run: %s\n", cutlassGetStatusString(status));
+        return -4;
+    }
+
+    cudaDeviceSynchronize();
+    return 0;
+}
+
 }  // extern "C"
