@@ -158,4 +158,4 @@ If you find this useful, please cite:
 
 ## License
 
-Apache 2.0 (our code). CUTLASS is BSD-3-Clause (NVIDIA).
+Apache 2.0. CUTLASS is BSD-3-Clause (NVIDIA).
